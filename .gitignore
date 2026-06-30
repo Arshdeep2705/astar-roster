@@ -1,0 +1,5 @@
+server.js
+*.png
+.playwright-mcp/
+_check.js
+node_modules/
