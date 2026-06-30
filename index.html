@@ -333,6 +333,10 @@ var DAYS_FULL = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","
 var MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 var PALETTE = ["#2563eb","#0d9488","#7c3aed","#db2777","#d97706","#0891b2","#dc2626","#65a30d"];
 var SKILLS = ["Manual handling","Medication","Personal care","Driving","Meal prep","Behaviour support","First aid","Female worker","Male worker","Auslan"];
+/* optional cloud sync (Supabase). Off until the owner turns it on with a workspace code.
+   The publishable key is meant to be public; data is protected by RLS + the secret code. */
+var SYNC={url:"https://hnblbcmnmfwsevjoozjc.supabase.co",key:"sb_publishable_Eshw8XbwlzXXQCFCoeh_xQ_e9RJ_2bZ"};
+var SYNC_KEY_LS="astar_sync_key", SYNC_CLOCK_LS="astar_sync_clock";
 
 /* ----------------------------- tiny utils ----------------------------- */
 function $(sel,root){return (root||document).querySelector(sel);}
@@ -457,11 +461,12 @@ function load(){
 }
 var _saveT=null;
 function save(){
+  cloudPushDebounced();
   if(_saveT)return; _saveT=setTimeout(function(){_saveT=null;
     try{localStorage.setItem(STORE_KEY,JSON.stringify(state));}catch(e){toast("Could not save — storage full or blocked","error");}
   },120);
 }
-function saveNow(){if(_saveT){clearTimeout(_saveT);_saveT=null;}try{localStorage.setItem(STORE_KEY,JSON.stringify(state));}catch(e){}}
+function saveNow(){if(_saveT){clearTimeout(_saveT);_saveT=null;}try{localStorage.setItem(STORE_KEY,JSON.stringify(state));}catch(e){}cloudPushDebounced();}
 
 /* ----------------------------- lookups ----------------------------- */
 function worker(id){return state.workers.filter(function(w){return w.id===id;})[0]||null;}
@@ -769,6 +774,7 @@ function toggleMenu(){
     menuItem("Clear all assignments","M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6",function(){closeMenu();clearAssignments();}),
     el("hr"),
     el("div",{class:"mlabel",text:"Data"}),
+    menuItem(syncEnabled()?"Cloud sync — on":"Cloud sync — set up","M17.5 19a4.5 4.5 0 0 0 .5-9 6 6 0 0 0-11.6-1.5A4 4 0 0 0 6 19z",function(){closeMenu();openSyncModal();}),
     menuItem("Share worker schedules","M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8M16 6l-4-4-4 4M12 2v13",function(){closeMenu();openShareModal();}),
     menuItem("Print / Save PDF","M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v8H6z",function(){closeMenu();window.print();}),
     menuItem("Export backup (.json)","M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3",function(){closeMenu();exportData();}),
@@ -835,6 +841,49 @@ function resetDemo(){
 function safeGet(k){try{return localStorage.getItem(k);}catch(e){return null;}}
 function safeSet(k,v){try{localStorage.setItem(k,v);}catch(e){}}
 
+/* ---------- cloud sync (optional, additive — app works fully without it) ---------- */
+function syncKey(){return safeGet(SYNC_KEY_LS)||"";}
+function syncEnabled(){return syncKey().length>=12;}
+function syncClock(){return safeGet(SYNC_CLOCK_LS)||"";}
+function setSyncClock(ts){safeSet(SYNC_CLOCK_LS,ts==null?"":String(ts));}
+function genSyncCode(){
+  var chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789",out="astar-",arr=null;
+  try{arr=new Uint32Array(16);crypto.getRandomValues(arr);}catch(e){arr=null;}
+  for(var i=0;i<16;i++){var r=arr?arr[i]%chars.length:Math.floor(Math.random()*chars.length);out+=chars.charAt(r);if(i===7)out+="-";}
+  return out; // e.g. astar-XXXXXXXX-XXXXXXXX
+}
+function rpc(fn,body){
+  return fetch(SYNC.url+"/rest/v1/rpc/"+fn,{method:"POST",headers:{"apikey":SYNC.key,"Authorization":"Bearer "+SYNC.key,"Content-Type":"application/json"},body:JSON.stringify(body)})
+    .then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json();});
+}
+var _cloudT=null;
+function cloudPush(opts){
+  if(!syncEnabled())return Promise.resolve(false);
+  return rpc("astar_roster_save",{p_key:syncKey(),p_data:state}).then(function(ts){
+    if(ts)setSyncClock(ts);return true;
+  }).catch(function(){if(opts&&opts.toast)toast("Cloud sync failed — saved on this device","warn");return false;});
+}
+function cloudPushDebounced(){
+  if(!syncEnabled())return;
+  if(_cloudT)clearTimeout(_cloudT);
+  _cloudT=setTimeout(function(){_cloudT=null;cloudPush();},1500);
+}
+function cloudPull(){
+  if(!syncEnabled())return Promise.resolve(null);
+  return rpc("astar_roster_load",{p_key:syncKey()}).then(function(res){return res||null;});
+}
+function syncBoot(){
+  if(!syncEnabled())return;
+  cloudPull().then(function(remote){
+    if(remote&&remote.data){
+      if(syncClock()===""||String(remote.updated_at)>String(syncClock())){
+        try{state=normalizeState(remote.data);}catch(e){return;}
+        setSyncClock(remote.updated_at);saveNow();render();toast("Loaded the latest roster from the cloud","success");
+      }else{cloudPush();}
+    }else{cloudPush();}
+  }).catch(function(){/* offline — keep working from this device */});
+}
+
 /* ---------- share / send schedules ---------- */
 function workerScheduleText(w){
   var s=state.settings.periodStart,e=addDays(s,periodLen()-1);
@@ -879,6 +928,61 @@ function openShareModal(){
     el("button",{class:"btn",onClick:closeModal},"Close"),
     state.workers.length?el("button",{class:"btn primary",onClick:function(){copyText(allText.join("\n\n"),this);}},"Copy all"):null
   ]);
+}
+
+/* ---------- cloud sync modal ---------- */
+var cloudSvg='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 0 0 .5-9 6 6 0 0 0-11.6-1.5A4 4 0 0 0 6 19z"/></svg>';
+function openSyncModal(){
+  var body=el("div",{});
+  if(!syncEnabled()){
+    body.appendChild(el("p",{class:"muted",style:{margin:"0 0 14px",fontSize:"14px"},text:"Keep this roster in sync across your phone and laptop. It's off by default — your data stays on this device until you turn it on. You'll get a private sync code to use on your other devices."}));
+    body.appendChild(el("button",{class:"btn primary",style:{width:"100%",justifyContent:"center",marginBottom:"16px"},onClick:function(){
+      safeSet(SYNC_KEY_LS,genSyncCode());setSyncClock("");
+      cloudPush({toast:true}).then(function(ok){if(ok)toast("Cloud sync is on","success");openSyncModal();});
+    }},[el("span",{html:cloudSvg}),"Turn on cloud sync"]));
+    var input=el("input",{type:"text",placeholder:"astar-XXXXXXXX-XXXXXXXX"});
+    body.appendChild(el("div",{class:"field",style:{marginBottom:"0"}},[
+      el("label",{text:"Already set up on another device?"}),
+      el("div",{class:"hint",style:{marginBottom:"6px"},text:"Paste the sync code from that device to load the same roster here."}),
+      el("div",{style:{display:"flex",gap:"8px"}},[input,
+        el("button",{class:"btn",onClick:function(){
+          var code=(input.value||"").trim();if(code.length<12){toast("That code looks too short","warn");return;}
+          safeSet(SYNC_KEY_LS,code);setSyncClock("");
+          cloudPull().then(function(remote){
+            if(remote&&remote.data){try{state=normalizeState(remote.data);setSyncClock(remote.updated_at);saveNow();}catch(e){}toast("Connected — roster loaded","success");}
+            else{cloudPush();toast("Connected — this roster is now shared","success");}
+            closeModal();render();
+          }).catch(function(){safeSet(SYNC_KEY_LS,"");toast("Could not reach the cloud — check your connection","error");});
+        }},"Join")])
+    ]));
+  }else{
+    var code=syncKey();
+    body.appendChild(el("div",{class:"banner",style:{marginBottom:"14px"}},[
+      el("span",{class:"bn-ic",html:cloudSvg}),
+      el("div",{},[el("strong",{text:"Cloud sync is on"}),el("div",{style:{fontSize:"13px"},text:"This roster syncs to your other devices using the code below."})])
+    ]));
+    var codeInput=el("input",{type:"text",readonly:"readonly",value:code,onClick:function(){try{this.select();}catch(e){}}});
+    body.appendChild(el("div",{class:"field"},[
+      el("label",{text:"Your sync code"}),
+      el("div",{style:{display:"flex",gap:"8px"}},[codeInput,el("button",{class:"btn",onClick:function(){copyText(code,this);}},"Copy")]),
+      el("div",{class:"hint",style:{marginTop:"6px"},text:"On your other device: open this app, tap Cloud sync, and paste this code. Anyone with the code can see this roster, so keep it private."})
+    ]));
+    body.appendChild(el("div",{style:{display:"flex",gap:"8px",flexWrap:"wrap"}},[
+      el("button",{class:"btn",onClick:function(){
+        cloudPull().then(function(remote){
+          if(remote&&remote.data&&String(remote.updated_at)>String(syncClock())){
+            try{state=normalizeState(remote.data);setSyncClock(remote.updated_at);saveNow();render();toast("Pulled the latest from the cloud","success");}catch(e){}
+          }else{cloudPush({toast:true}).then(function(ok){if(ok)toast("Synced to the cloud","success");});}
+        }).catch(function(){toast("Could not reach the cloud","error");});
+      }},[icon("M23 4v6h-6M1 20v-6h6M3.5 9a9 9 0 0 1 14.8-3.4L23 10M1 14l4.7 4.4A9 9 0 0 0 20.5 15"),"Sync now"]),
+      el("button",{class:"btn danger",onClick:function(){
+        confirmDialog("Turn off cloud sync on this device?","Your roster stays on this device and the cloud copy is untouched. You can rejoin later with the same code.","Turn off",true).then(function(ok){
+          if(ok){safeSet(SYNC_KEY_LS,"");setSyncClock("");closeModal();toast("Cloud sync turned off here","success");render();}
+        });
+      }},"Turn off sync")
+    ]));
+  }
+  openModal("Cloud sync",body,[el("button",{class:"btn",onClick:closeModal},"Close")]);
 }
 
 /* ============================================================================
@@ -1609,11 +1713,14 @@ function boot(){
   document.addEventListener("visibilitychange",function(){if(document.hidden)saveNow();});
   window.addEventListener("error",function(){try{toast("Something went wrong — your data is safe","error");}catch(e){}});
   render();
+  syncBoot(); // if cloud sync is on, pull the latest across devices
 }
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",boot);else boot();
 
 // expose a couple of helpers for headless testing
-window.__roster={get state(){return state;},validate:validate,autoRoster:autoRoster,toMin:toMin,overlaps:overlaps,blockCovers:blockCovers,addDays:addDays,dow:dow,generateShifts:generateShifts,load:load};
+window.__roster={get state(){return state;},validate:validate,autoRoster:autoRoster,toMin:toMin,overlaps:overlaps,blockCovers:blockCovers,addDays:addDays,dow:dow,generateShifts:generateShifts,load:load,
+  syncEnabled:syncEnabled,cloudPush:cloudPush,cloudPull:cloudPull,syncKey:syncKey,genSyncCode:genSyncCode,rpc:rpc,
+  setKey:function(k){safeSet(SYNC_KEY_LS,k);setSyncClock("");},clearKey:function(){safeSet(SYNC_KEY_LS,"");setSyncClock("");}};
 
 })();
 </script>
